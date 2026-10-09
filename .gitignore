@@ -1,0 +1,6 @@
+**/.yahoo_tokens.json
+**/.env
+**/state/
+**/sleeper_players.json
+__pycache__/
+*.pyc
