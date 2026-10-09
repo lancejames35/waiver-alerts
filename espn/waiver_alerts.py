@@ -544,10 +544,13 @@ def main():
             return k is not None and k <= now_ts
 
         ls = state["leagues"].setdefault(lid, {})
+        print(f"{d['name']}: week {d['week']}, {len(d['mine'])} rostered, {len(d['avail'])} available, "
+              f"waivers {d['waiver_days']}, {len(kick)} kickoffs known, quiet={quiet}, force={FORCE_DIGEST}")
 
         # immediate pushes
         events = detect_events(d, ls, is_locked, byes)
         queue = ls.get("queue", []) + events
+        print(f"  events this run: {len(events)}, sending now: {0 if quiet else len(queue)}")
         if quiet:
             ls["queue"] = queue
         else:
@@ -561,6 +564,7 @@ def main():
             _, full, label = due
             lineup = lineup_issues(d, is_locked, byes)
             built = build_digest(d, lineup, pickup_rows(d, is_locked), ls.get("last_digest", {}), full, label)
+            print(f"  digest due ({due[0]}): {'sent' if built else 'skipped, nothing new'}")
             if built:
                 title, body, current = built
                 prio = 4 if lineup else 3
