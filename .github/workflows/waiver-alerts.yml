@@ -42,7 +42,7 @@ jobs:
           ESPN_S2: ${{ secrets.ESPN_S2 }}
           ESPN_SWID: ${{ secrets.ESPN_SWID }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          FORCE_DIGEST: ${{ inputs.force_digest && '1' || '0' }}
+          FORCE_DIGEST: ${{ github.event.inputs.force_digest }}
         run: python waiver_alerts.py
 
       - name: Save state

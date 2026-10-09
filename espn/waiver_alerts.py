@@ -52,6 +52,7 @@ TZ = ZoneInfo("America/Chicago")
 DAILY_DIGEST_HOURS = [8, 12, 18]
 SUNDAY_FULL_HOUR = 11
 PREWAIVER_HOUR = 20                  # evening before each waiver process day
+PREWAIVER_MAX_DAYS = 2               # leagues processing more often than this (rolling waivers) get no pre-waiver digest
 DEFAULT_WAIVER_DAYS = ["WEDNESDAY"]  # used if the league setting can't be read
 QUIET_START, QUIET_END = 23, 7       # immediate pushes held in this window, sent at 7am
 DIGEST_PER_POSITION = 2
@@ -98,7 +99,7 @@ SLEEPER_FILE = os.path.join(STATE_DIR, "sleeper_ids.json")
 STATE_VERSION = 2
 
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
-FORCE_DIGEST = os.environ.get("FORCE_DIGEST") == "1"
+FORCE_DIGEST = os.environ.get("FORCE_DIGEST", "").lower() in ("1", "true")
 
 
 # ================= helpers =================
@@ -377,7 +378,7 @@ def digest_due(now, waiver_days):
     """(kind, full, label) or None."""
     if now.weekday() == 6 and now.hour == SUNDAY_FULL_HOUR:
         return "sunday", True, "Game day"
-    for day in waiver_days:
+    for day in (waiver_days if len(waiver_days) <= PREWAIVER_MAX_DAYS else []):
         if now.weekday() == (DAYS.index(day) - 1) % 7 and now.hour == PREWAIVER_HOUR:
             return "waivers", True, "Waivers tonight"
     if now.hour in DAILY_DIGEST_HOURS:
