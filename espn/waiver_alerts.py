@@ -56,7 +56,9 @@ PREWAIVER_MAX_DAYS = 2               # leagues processing more often than this (
 DEFAULT_WAIVER_DAYS = ["WEDNESDAY"]  # used if the league setting can't be read
 QUIET_START, QUIET_END = 23, 7       # immediate pushes held in this window, sent at 7am
 DIGEST_PER_POSITION = 2
-DIGEST_CHANGE_MIN = 1.0              # a repeated pickup row only reappears if its number moved this much
+LOOKAHEAD_DAYS = {3, 4, 5, 6}         # Thu-Sun digests include next week's bye holes
+DIGEST_CHANGE_WK = 1.0               # a repeated weekly row only reappears if it moved this many points
+DIGEST_CHANGE_ROS = 10.0             # same for rest-of-season rows (those drift constantly)
 
 # pickup sections
 WEEKLY_MARGIN = 1.5                  # beats your worst at position this week by this many points
@@ -72,6 +74,8 @@ ROSTER_ROS_PCT, ROSTER_ROS_PTS = 0.15, 20.0
 AVAIL_WK_UP, AVAIL_WK_FLOOR = 4.0, 8.0
 AVAIL_ROS_UP = 20.0
 NOTABLE_OWN_PCT = 50.0               # newly free agent counts as notable at this % rostered on ESPN
+RISE_MIN_PCT = 0.80                  # rising alert only if the player reaches this share of your worst at position
+SETTLE_HOURS = 24                    # no projection-move alerts this long after a new week starts (ESPN rebuilding)
 # ==========================================
 
 READ_BASE = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
@@ -127,30 +131,38 @@ def stat(player, source, split, period):
     return 0.0
 
 
-def short(p):
-    """'Jacoby Brissett' -> 'J. Brissett'; D/ST unchanged; [W] if on waivers."""
+def short(p, tag=True):
+    """'Jacoby Brissett' -> 'J. Brissett'; D/ST unchanged; (W) if on waivers."""
     parts = p["name"].split()
     name = p["name"] if p["pos"] == "D/ST" or len(parts) < 2 else f"{parts[0][0]}. {' '.join(parts[1:])}"
-    return name + (" [W]" if p.get("tag") == "W" else "")
+    return name + (" (W)" if tag and p.get("tag") == "W" else "")
+
+
+def label(p):
+    """'T. Higbee (TE, W)'"""
+    return f"{short(p, tag=False)} ({p['pos']}{', W' if p.get('tag') == 'W' else ''})"
 
 
 def last_name(p):
+    """'Amon-Ra St. Brown' -> 'St. Brown', 'Marvin Harrison Jr.' -> 'Harrison'."""
     parts = p["name"].split()
     if p["pos"] == "D/ST" or len(parts) < 2:
         return p["name"]
-    return parts[-2] if parts[-1] in SUFFIXES and len(parts) > 2 else parts[-1]
+    rest = parts[1:-1] if parts[-1] in SUFFIXES and len(parts) > 2 else parts[1:]
+    return " ".join(rest)
 
 
-def worst(mine, pos, key, skip_zero=False):
+def worst(mine, pos, key, skip_zero=True):
     c = [m for m in mine if m["pos"] == pos and m["slot"] != IR and (m[key] > 0 or not skip_zero)]
     return min(c, key=lambda m: m[key]) if c else None
 
 
 def notify(title, message, priority=3, tags=None, actions=None, click=None):
+    # always logged, so past notifications can be reviewed from the GitHub run logs
+    print(f"\n----- SENT{' (dry run)' if DRY_RUN else ''}: {title}  [priority {priority}] -----\n{message}")
+    for a in actions or []:
+        print(f"  [{a['label']}] {a['url']}")
     if DRY_RUN:
-        print(f"\n===== {title}  (priority {priority}, tags {tags}) =====\n{message}")
-        for a in actions or []:
-            print(f"  [{a['label']}] {a['url']}")
         return
     r = requests.post("https://ntfy.sh/", json={
         "topic": os.environ["NTFY_TOPIC"], "title": title, "message": message,
@@ -183,31 +195,39 @@ def sleeper_trending():
 
 
 def schedule(state, week, cookies):
-    """Kickoff time per NFL team and bye teams for the week. Refreshed every 6 hours (flexed games)."""
+    """(kickoff per NFL team this week, bye teams this week, {team: bye week}). Refreshed every 6 hours."""
     c = state.get("schedule") or {}
-    if c.get("week") == week and time.time() - c.get("fetched", 0) < 6 * 3600:
-        return {int(k): v for k, v in c["kick"].items()}, set(c["bye"])
+    if c.get("week") == week and time.time() - c.get("fetched", 0) < 6 * 3600 and "byeweek" in c:
+        return ({int(k): v for k, v in c["kick"].items()}, set(c["bye"]),
+                {int(k): v for k, v in c["byeweek"].items()})
     try:
         r = requests.get(READ_BASE.format(season=SEASON), params={"view": "proTeamSchedules_wl"},
                          cookies=cookies, timeout=30)
         r.raise_for_status()
-        kick, bye = {}, set()
+        kick, bye, byeweek = {}, set(), {}
         for t in r.json()["settings"]["proTeams"]:
+            byeweek[t["id"]] = t.get("byeWeek")
             if t.get("byeWeek") == week:
                 bye.add(t["id"])
             for g in (t.get("proGamesByScoringPeriod") or {}).get(str(week), []):
                 kick[t["id"]] = g["date"] / 1000
-        state["schedule"] = {"week": week, "fetched": time.time(), "kick": kick, "bye": sorted(bye)}
-        return kick, bye
+        state["schedule"] = {"week": week, "fetched": time.time(), "kick": kick, "bye": sorted(bye),
+                             "byeweek": byeweek}
+        return kick, bye, byeweek
     except Exception as ex:
         print(f"Schedule unavailable ({ex}); nothing frozen this run.")
-        return {}, set()
+        return {}, set(), {}
 
 
 def to_player(p, week):
     return {"id": str(p["id"]), "name": p["fullName"], "pos": POS.get(p.get("defaultPositionId")),
             "team": p.get("proTeamId"), "status": STATUS.get(p.get("injuryStatus"), str(p.get("injuryStatus")).title()),
-            "wk": stat(p, 1, 1, week), "ros": stat(p, 1, 0, 0), "elig": p.get("eligibleSlots") or []}
+            "wk": stat(p, 1, 1, week), "ros": stat(p, 1, 0, 0), "act": stat(p, 0, 1, week),
+            "elig": p.get("eligibleSlots") or []}
+
+
+def team_name(t):
+    return (t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}").strip() or f"Team {t['id']}"
 
 
 def fetch_league(lg, cookies, trending):
@@ -220,13 +240,36 @@ def fetch_league(lg, cookies, trending):
     acq = sd.get("settings", {}).get("acquisitionSettings", {}) or {}
     waiver_days = [x for x in (acq.get("waiverProcessDays") or []) if x in DAYS] or DEFAULT_WAIVER_DAYS
 
-    r = requests.get(url, params={"view": "mRoster", "scoringPeriodId": week}, cookies=cookies, timeout=30)
+    r = requests.get(url, params=[("view", "mRoster"), ("view", "mTeam"), ("scoringPeriodId", week)],
+                     cookies=cookies, timeout=30)
     r.raise_for_status()
     teams = r.json()["teams"]
     team = next((t for t in teams if t["id"] == lg["team_id"]), None)
     if not team:
         raise RuntimeError(f"team {lg['team_id']} not found")
     rostered = {str(e["playerId"]) for t in teams for e in t.get("roster", {}).get("entries", [])}
+
+    opp = None
+    try:
+        periods = sd["settings"].get("scheduleSettings", {}).get("matchupPeriods", {}) or {}
+        mp = next((int(k) for k, v in periods.items() if week in v), week)
+        m = requests.get(url, params={"view": "mMatchupScore", "scoringPeriodId": week}, cookies=cookies, timeout=30)
+        m.raise_for_status()
+        for g in m.json().get("schedule", []):
+            ids = [(g.get("home") or {}).get("teamId"), (g.get("away") or {}).get("teamId")]
+            if g.get("matchupPeriodId") == mp and lg["team_id"] in ids:
+                oid = ids[1] if ids[0] == lg["team_id"] else ids[0]
+                ot = next((t for t in teams if t["id"] == oid), None)
+                if ot:
+                    players = []
+                    for e in ot["roster"]["entries"]:
+                        pl = to_player(e["playerPoolEntry"]["player"], week)
+                        pl["slot"] = e.get("lineupSlotId")
+                        players.append(pl)
+                    opp = {"name": team_name(ot), "players": players}
+                break
+    except Exception as ex:
+        print(f"Matchup unavailable ({ex})")
 
     mine = []
     for e in team["roster"]["entries"]:
@@ -256,122 +299,225 @@ def fetch_league(lg, cookies, trending):
         avail.append(pl)
 
     return {"lid": str(lg["id"]), "name": sd["settings"]["name"].strip(), "week": week, "mine": mine,
-            "avail": avail, "rostered": rostered, "waiver_days": waiver_days,
+            "avail": avail, "rostered": rostered, "waiver_days": waiver_days, "opp": opp,
             "fa_url": FA_PAGE.format(lid=lg["id"]),
             "team_url": TEAM_PAGE.format(lid=lg["id"], tid=lg["team_id"], season=SEASON)}
 
 
 # ================= lineup =================
 
+def usable(p, is_locked, byes):
+    return (not is_locked(p) and p["status"] not in BAD_FOR_LINEUP
+            and p["team"] not in byes and p["wk"] > 0)
+
+
+def replacement(d, starter, is_locked, byes, used=()):
+    """(best bench player, best free agent) eligible for this starter's slot."""
+    bench = [b for b in d["mine"] if b["slot"] == BENCH and starter["slot"] in b["elig"]
+             and b["id"] not in used and usable(b, is_locked, byes)]
+    fas = [a for a in d["avail"] if starter["slot"] in a["elig"]
+           and a["id"] not in used and usable(a, is_locked, byes)]
+    return (max(bench, key=lambda b: b["wk"], default=None),
+            max(fas, key=lambda a: a["wk"], default=None))
+
+
+def drop_candidate(d, pos, exclude=()):
+    """Who to cut for a pickup: your lowest rest-of-season bench player at that position;
+    otherwise your lowest bench player overall (K/D/ST pickups always replace your K/D/ST)."""
+    exclude = set(exclude) | d.get("protect", set())  # never cut someone we just told you to start
+    bench = [m for m in d["mine"] if m["slot"] == BENCH and m["id"] not in exclude]
+    same = [m for m in bench if m["pos"] == pos]
+    if pos in ("K", "D/ST") and not same:
+        same = [m for m in d["mine"] if m["pos"] == pos and m["slot"] != IR and m["id"] not in exclude]
+    pool = same or [m for m in bench if m["pos"] not in ("K", "D/ST")]
+    return min(pool, key=lambda m: m["ros"], default=None)
+
+
+def use_fa(b, f):
+    return bool(f and (not b or f["wk"] >= b["wk"] + LINEUP_MARGIN))
+
+
+def fix_text(d, b, f, exclude=()):
+    """'start Shough 19.9' / 'add G. Bernard (W) 10.6, drop Allen'."""
+    if use_fa(b, f):
+        drop = drop_candidate(d, f["pos"], exclude)
+        alt = b and (not drop or drop["id"] != b["id"])
+        return (f"add {short(f)} {f['wk']:.1f}" + (f", drop {last_name(drop)}" if drop else "")
+                + (f" (or start {last_name(b)} {b['wk']:.1f})" if alt else ""))
+    if b:
+        return f"start {last_name(b)} {b['wk']:.1f}"
+    return "no replacement found"
+
+
 def lineup_issues(d, is_locked, byes):
-    """[(key, text)] for starters who are out/bye/zero or out-projected by an eligible bench player."""
+    """[(key, text, gain)]: starters out/bye/zero, or out-projected by an eligible bench player.
+    gain = projected points the suggested fix adds."""
     starters = [m for m in d["mine"] if m["slot"] not in (BENCH, IR) and not is_locked(m)]
-    bench = [m for m in d["mine"] if m["slot"] == BENCH and not is_locked(m)
-             and m["status"] not in BAD_FOR_LINEUP and m["team"] not in byes and m["wk"] > 0]
-    out, used = [], set()
-    for s in sorted(starters, key=lambda m: POSITIONS.index(m["pos"])):
-        reason = (s["status"] if s["status"] in BAD_FOR_LINEUP else
-                  "on bye" if s["team"] in byes else "projected 0" if s["wk"] == 0 else None)
-        cands = [b for b in bench if s["slot"] in b["elig"] and b["id"] not in used]
-        best = max(cands, key=lambda b: b["wk"], default=None)
+    out, used, starts = [], set(), set()
+
+    def reason_for(s):
+        return (f"is {s['status']}" if s["status"] in BAD_FOR_LINEUP else
+                "on bye" if s["team"] in byes else "projected 0" if s["wk"] == 0 else None)
+
+    # starters who can't play get first pick of replacements, then upgrades over weak starters
+    for s in sorted(starters, key=lambda m: (reason_for(m) is None, POSITIONS.index(m["pos"]))):
+        reason = reason_for(s)
+        b, f = replacement(d, s, is_locked, byes, used)
         if reason:
-            if best:
-                out.append((f"lineup:{s['id']}:{best['id']}",
-                            f"Start {short(best)} {best['wk']:.1f} over {short(s)} ({reason})"))
-                used.add(best["id"])
-            else:
-                out.append((f"lineup:{s['id']}:none", f"{short(s)} is {reason}, no bench option"))
-        elif best and best["wk"] >= s["wk"] + LINEUP_MARGIN:
-            out.append((f"lineup:{s['id']}:{best['id']}",
-                        f"Start {short(best)} {best['wk']:.1f} over {short(s)} {s['wk']:.1f}"))
-            used.add(best["id"])
+            pick = f if use_fa(b, f) else b
+            if pick:
+                starts.add(pick["id"])
+            out.append((f"lineup:{s['id']}:{reason}", f"{last_name(s)} {reason} → {fix_text(d, b, f, used)}",
+                        max(0.0, pick["wk"] - s["wk"]) if pick else 0.0))
+            used.update(x["id"] for x in (b, f) if x)
+        elif b and b["wk"] >= s["wk"] + LINEUP_MARGIN:
+            out.append((f"lineup:{s['id']}:{b['id']}",
+                        f"{last_name(s)} {s['wk']:.1f} → start {last_name(b)} {b['wk']:.1f}", b["wk"] - s["wk"]))
+            used.add(b["id"])
+            starts.add(b["id"])
+    d["protect"] = starts
     return out
 
 
-def bench_option(d, starter, is_locked, byes):
-    cands = [b for b in d["mine"] if b["slot"] == BENCH and starter["slot"] in b["elig"] and not is_locked(b)
-             and b["status"] not in BAD_FOR_LINEUP and b["team"] not in byes and b["wk"] > 0]
-    return max(cands, key=lambda b: b["wk"], default=None)
+# ================= look-ahead + matchup =================
+
+def bye_holes(d, byeweek):
+    """[(key, text)] for starters on bye NEXT week that your bench can't cover."""
+    nxt = d["week"] + 1
+    out, used = [], set()
+    for s in sorted((m for m in d["mine"] if m["slot"] not in (BENCH, IR) and byeweek.get(m["team"]) == nxt),
+                    key=lambda m: POSITIONS.index(m["pos"])):
+        ok = lambda p: (byeweek.get(p["team"]) != nxt and p["status"] not in BAD_FOR_LINEUP
+                        and p["ros"] > 0 and p["id"] not in used and s["slot"] in p["elig"])
+        b = max((m for m in d["mine"] if m["slot"] == BENCH and ok(m)), key=lambda m: m["ros"], default=None)
+        f = max((a for a in d["avail"] if ok(a)), key=lambda a: a["ros"], default=None)
+        if b and (not f or f["ros"] < b["ros"] + SEASON_MARGIN):
+            used.add(b["id"])
+            continue  # covered from your bench
+        if f:
+            drop = drop_candidate(d, f["pos"], used | {s["id"]})
+            alt = b and (not drop or drop["id"] != b["id"])
+            text = (f"{last_name(s)} → stash {short(f)} ROS {f['ros']:.0f}"
+                    + (f", drop {last_name(drop)}" if drop else "")
+                    + (f" (or start {last_name(b)})" if alt else ""))
+            used.add(f["id"])
+        else:
+            text = f"{last_name(s)} → no cover found"
+        out.append((f"bye:{s['id']}:{nxt}", text))
+    return out
+
+
+def matchup_line(d, is_locked, lineup):
+    if not d.get("opp"):
+        return None
+
+    def total(players):
+        return sum(p["act"] if is_locked(p) else p["wk"] for p in players if p["slot"] not in (BENCH, IR))
+
+    me, them = total(d["mine"]), total(d["opp"]["players"])
+    gain = sum(g for _, _, g in lineup)
+    line = f"Projected {me:.1f} vs {them:.1f} ({d['opp']['name']})"
+    if gain >= 0.5:
+        line += f"\nWith lineup fixes: {me + gain:.1f}"
+    return line
 
 
 # ================= digest =================
 
-def pickup_rows(d, is_locked):
+def vs_drop(d, a, w, diff, decimals):
+    """'+7.2, drop Harrison' when the player he beats is the cut; else '+7.2 vs Harrison, drop Allen'."""
+    drop = drop_candidate(d, a["pos"])
+    gap = f"+{diff:.{decimals}f}"
+    if not drop or drop["id"] == w["id"]:
+        return f"{gap}, drop {last_name(w)}"
+    return f"{gap} vs {last_name(w)}, drop {last_name(drop)}"
+
+
+def pickup_rows(d, is_locked, full):
     """{section: [(pos, sortval, key, value, text)]}"""
     out = {"week": [], "ros": [], "hot": []}
     for a in d["avail"]:
-        w = worst(d["mine"], a["pos"], "wk", skip_zero=True)
+        w = worst(d["mine"], a["pos"], "wk")
         if w and not is_locked(a) and a["wk"] >= w["wk"] + WEEKLY_MARGIN:
             diff = a["wk"] - w["wk"]
             out["week"].append((a["pos"], diff, f"wk:{a['id']}", round(a["wk"], 1),
-                                f"{short(a)} {a['wk']:.1f} (+{diff:.1f} vs {short(w)})"))
+                                f"{a['pos']}  {short(a)} {a['wk']:.1f} · {vs_drop(d, a, w, diff, 1)}"))
         r = worst(d["mine"], a["pos"], "ros")
         if r and a["ros"] >= r["ros"] + SEASON_MARGIN:
             diff = a["ros"] - r["ros"]
             out["ros"].append((a["pos"], diff, f"ros:{a['id']}", round(a["ros"]),
-                               f"{short(a)} {a['ros']:.0f} (+{diff:.0f} vs {short(r)})"))
-    listed = {row[2].split(":", 1)[1] for sec in ("week", "ros") for row in out[sec]}
-    for a in d["avail"]:
-        r = worst(d["mine"], a["pos"], "ros")
-        relevant = not r or a["ros"] >= TRENDING_MIN_ROS_PCT * r["ros"]
-        if a["adds"] >= TRENDING_MIN_ADDS and relevant and a["id"] not in listed:
-            out["hot"].append((a["pos"], a["adds"], f"hot:{a['id']}", None,
-                               f"{short(a)} {a['adds'] / 1000:.1f}k adds, wk {a['wk']:.1f}"))
+                               f"{a['pos']}  {short(a)} {a['ros']:.0f} · {vs_drop(d, a, r, diff, 0)}"))
+    if full:  # trending only in full digests; rising alerts cover momentum during the week
+        listed = {row[2].split(":", 1)[1] for sec in ("week", "ros") for row in out[sec]}
+        for a in d["avail"]:
+            r = worst(d["mine"], a["pos"], "ros")
+            relevant = not r or a["ros"] >= TRENDING_MIN_ROS_PCT * r["ros"]
+            if (a["adds"] >= TRENDING_MIN_ADDS and relevant and a["wk"] > 0
+                    and not is_locked(a) and a["id"] not in listed):
+                out["hot"].append((a["pos"], a["adds"], f"hot:{a['id']}", None,
+                                   f"{a['pos']}  {short(a)} · {a['adds'] / 1000:.1f}k adds · wk {a['wk']:.1f}"))
     return out
 
 
-def build_digest(d, lineup, rows, last_items, full, label):
-    """Returns (title, body, current_items) or None if a routine digest has nothing new."""
-    current = {k: None for k, _ in lineup}
+def build_digest(d, lineup, rows, last_items, full, label_text, byes_next=(), matchup=None):
+    """Returns (title, body, current_items, has_new_lineup) or None if a routine digest has nothing new."""
+    current = {k: None for k, *_ in list(lineup) + list(byes_next)}
     for sec in rows.values():
         for _, _, key, val, _ in sec:
             current[key] = val
 
-    def is_new(key, val):
+    def is_new(key, val, min_change=0):
         if full or key not in last_items:
             return True
         old = last_items[key]
-        return val is not None and old is not None and abs(val - old) >= DIGEST_CHANGE_MIN
+        return val is not None and old is not None and abs(val - old) >= min_change
 
-    lines, new_pickups, hidden = [], 0, 0
-    if lineup:
-        lines.append("⚠️ LINEUP")
-        lines += [f"  {text}" for _, text in lineup]
-        lines.append("")
+    blocks, hidden = [], 0
+    shown_lineup = [text for key, text, _ in lineup if is_new(key, None)]
+    hidden += len(lineup) - len(shown_lineup)
+    if shown_lineup:
+        blocks.append("⚠️ LINEUP\n" + "\n".join(shown_lineup))
+    shown_byes = [text for key, text in byes_next if is_new(key, None)]
+    hidden += len(byes_next) - len(shown_byes)
+    if shown_byes:
+        blocks.append(f"BYES NEXT WEEK (Wk {d['week'] + 1})\n" + "\n".join(shown_byes))
 
-    for title, sec in (("📋 THIS WEEK", "week"), ("📅 REST OF SEASON", "ros"), ("🔥 TRENDING", "hot")):
+    counts = {}
+    for title, sec, change in (("THIS WEEK", "week", DIGEST_CHANGE_WK),
+                               ("REST OF SEASON", "ros", DIGEST_CHANGE_ROS),
+                               ("TRENDING", "hot", 0)):
         shown = []
         for pos in POSITIONS:
             group = sorted((r for r in rows[sec] if r[0] == pos), key=lambda r: r[1], reverse=True)[:DIGEST_PER_POSITION]
             for _, _, key, val, text in group:
-                if is_new(key, val):
-                    shown.append(f"  {pos}  {text}")
+                if is_new(key, val, change):
+                    shown.append(text)
                 else:
                     hidden += 1
         if shown:
-            lines.append(title)
-            lines += shown
-            lines.append("")
-            new_pickups += len(shown)
+            blocks.append(f"{title}\n" + "\n".join(shown))
+            counts[sec] = len(shown)
 
-    if not full and not lineup and new_pickups == 0:
+    new_pickups = sum(counts.values())
+    if not full and not shown_lineup and not shown_byes and new_pickups == 0:
         return None
-    if hidden:
-        lines.append(f"({hidden} unchanged since last digest)")
-    if not lines:
-        lines = ["Lineup is set and nothing on the wire beats your roster."]
 
-    parts = [f"{d['name']} · Wk {d['week']}"]
-    if label:
-        parts.append(label)
-    counts = []
-    if lineup:
-        counts.append(f"{len(lineup)} lineup")
+    summary = []
+    if shown_lineup:
+        summary.append(f"{len(shown_lineup)} lineup fix{'es' if len(shown_lineup) > 1 else ''}")
+    if shown_byes:
+        summary.append(f"{len(shown_byes)} bye hole{'s' if len(shown_byes) > 1 else ''}")
     if new_pickups:
-        counts.append(f"{new_pickups} {'pickups' if full else 'new'}")
-    if counts:
-        parts.append(", ".join(counts))
-    return " · ".join(parts), "\n".join(lines).strip(), current
+        summary.append(f"{new_pickups} {'pickup' if full else 'new pickup'}{'s' if new_pickups > 1 else ''}")
+    body = [" · ".join(summary) if summary else "Lineup set, nothing on the wire beats your roster."]
+    if matchup:
+        body[0] = matchup + "\n" + body[0]
+    body += blocks
+    if hidden:
+        body.append(f"({hidden} unchanged since last digest)")
+
+    title = f"{d['name']} · Wk {d['week']}" + (f" · {label_text}" if label_text else "")
+    return title, "\n\n".join(body), current, bool(shown_lineup)
 
 
 def digest_due(now, waiver_days):
@@ -388,21 +534,26 @@ def digest_due(now, waiver_days):
 
 # ================= immediate events =================
 
-def ev(kind, title, text, prio):
-    return {"kind": kind, "title": title, "text": text, "prio": prio}
+def ev(d, kind, title, text, prio, roster):
+    return {"league": d["name"], "fa_url": d["fa_url"], "team_url": d["team_url"],
+            "kind": kind, "title": title, "text": text, "prio": prio, "roster": roster}
 
 
-def detect_events(d, ls, is_locked, byes):
+def detect_events(d, ls, is_locked, byes, now_ts):
     """Compares this run to league state; returns events and mutates ls baselines/status maps."""
-    new_week = ls.get("week") != d["week"]
-    first_run = "status" not in ls
-    if new_week:
+    if ls.get("week") != d["week"]:
         ls["base_wk"], ls["base_ros"] = {}, {}
+        ls["week_start"] = now_ts
+    settling = now_ts - ls.get("week_start", 0) < SETTLE_HOURS * 3600
+    first_run = "status" not in ls
     base_wk, base_ros = ls.setdefault("base_wk", {}), ls.setdefault("base_ros", {})
     prev_status = ls.get("status", {})
     prev_tag = ls.get("avail_tag", {})
     prev_rostered = set(ls.get("rostered", []))
     events = []
+
+    def moved(cur, base, pct, pts):
+        return abs(cur - base) >= pts and (base == 0 or abs(cur - base) >= pct * base)
 
     for m in d["mine"]:
         pid = m["id"]
@@ -410,92 +561,110 @@ def detect_events(d, ls, is_locked, byes):
             continue
         old = prev_status.get(pid)
         status_changed = not first_run and old is not None and old != m["status"]
-        if status_changed:
-            text = f"{m['pos']} {short(m)}: {old} → {m['status']}"
-            starter = m["slot"] not in (BENCH, IR)
-            if starter and m["status"] in BAD_FOR_LINEUP:
-                alt = bench_option(d, m, is_locked, byes)
-                text += f". Start {short(alt)} {alt['wk']:.1f}" if alt else ". No bench option"
+        # skip routine Questionable -> Healthy; right after a new week starts, only serious changes push
+        worth_it = (m["status"] in BAD_FOR_LINEUP if settling else
+                    m["status"] != "Healthy" or old in BAD_FOR_LINEUP)
+        if status_changed and worth_it:
+            text = f"{label(m)}: {old} → {m['status']}"
+            if m["slot"] not in (BENCH, IR) and m["status"] in BAD_FOR_LINEUP:
+                b, f = replacement(d, m, is_locked, byes)
+                text += f" · {fix_text(d, b, f)}"
             kind = "healthy" if m["status"] == "Healthy" else "injury"
-            events.append(ev(kind, f"{last_name(m)} {m['status']}", text, 4 if m["status"] in BAD_FOR_LINEUP else 3))
+            events.append(ev(d, kind, f"{last_name(m)} {m['status']}", text,
+                             4 if m["status"] in BAD_FOR_LINEUP else 3, True))
 
-        bw = base_wk.get(pid)
-        if bw is None:
+        if settling:
+            base_wk[pid], base_ros[pid] = m["wk"], m["ros"]
+            continue
+
+        bw = base_wk.setdefault(pid, m["wk"])
+        if moved(m["wk"], bw, ROSTER_WK_PCT, ROSTER_WK_PTS):
+            if not status_changed:  # the injury alert already explains this move
+                up = m["wk"] > bw
+                events.append(ev(d, "up" if up else "down", f"{last_name(m)} {'up' if up else 'down'} this week",
+                                 f"{label(m)}: this week {bw:.1f} → {m['wk']:.1f}", 3, True))
             base_wk[pid] = m["wk"]
-        else:
-            diff = m["wk"] - bw
-            if abs(diff) >= ROSTER_WK_PTS and (bw == 0 or abs(diff) >= ROSTER_WK_PCT * bw):
-                if not status_changed:  # the injury alert already explains this move
-                    kind = "up" if diff > 0 else "down"
-                    events.append(ev(kind, f"{last_name(m)} {'up' if diff > 0 else 'down'} this week",
-                                     f"{m['pos']} {short(m)}: this week {bw:.1f} → {m['wk']:.1f}", 3))
-                base_wk[pid] = m["wk"]
 
-        br = base_ros.get(pid)
-        if br is None:
+        br = base_ros.setdefault(pid, m["ros"])
+        if moved(m["ros"], br, ROSTER_ROS_PCT, ROSTER_ROS_PTS):
+            up = m["ros"] > br
+            events.append(ev(d, "up" if up else "down", f"{last_name(m)} ROS {'up' if up else 'down'}",
+                             f"{label(m)}: rest of season {br:.0f} → {m['ros']:.0f}", 3, True))
             base_ros[pid] = m["ros"]
-        else:
-            diff = m["ros"] - br
-            if abs(diff) >= ROSTER_ROS_PTS and (br == 0 or abs(diff) >= ROSTER_ROS_PCT * br):
-                kind = "up" if diff > 0 else "down"
-                events.append(ev(kind, f"{last_name(m)} ROS {'up' if diff > 0 else 'down'}",
-                                 f"{m['pos']} {short(m)}: rest of season {br:.0f} → {m['ros']:.0f}", 3))
-                base_ros[pid] = m["ros"]
 
     for a in d["avail"]:
         pid = a["id"]
         if is_locked(a):
             continue
-        bw = base_wk.get(pid)
-        if bw is None:
-            base_wk[pid] = a["wk"]
-        elif a["wk"] - bw >= AVAIL_WK_UP and a["wk"] >= AVAIL_WK_FLOOR:
-            w = worst(d["mine"], a["pos"], "wk", skip_zero=True)
-            ctx = f" (your worst {a['pos']}: {short(w)} {w['wk']:.1f})" if w else ""
-            events.append(ev("rise", f"{last_name(a)} rising",
-                             f"{a['pos']} {short(a)}: this week {bw:.1f} → {a['wk']:.1f}{ctx}", 3))
-            base_wk[pid] = a["wk"]
-
-        br = base_ros.get(pid)
-        if br is None:
-            base_ros[pid] = a["ros"]
-        elif a["ros"] - br >= AVAIL_ROS_UP:
-            r = worst(d["mine"], a["pos"], "ros")
-            ctx = f" (your worst {a['pos']}: {short(r)} {r['ros']:.0f})" if r else ""
-            events.append(ev("rise", f"{last_name(a)} ROS rising",
-                             f"{a['pos']} {short(a)}: rest of season {br:.0f} → {a['ros']:.0f}{ctx}", 3))
-            base_ros[pid] = a["ros"]
 
         was_held = prev_tag.get(pid) != "FA" and (pid in prev_rostered or prev_tag.get(pid) == "W")
         if not first_run and a["tag"] == "FA" and was_held:
-            w = worst(d["mine"], a["pos"], "wk", skip_zero=True)
-            r = worst(d["mine"], a["pos"], "ros")
+            w, r = worst(d["mine"], a["pos"], "wk"), worst(d["mine"], a["pos"], "ros")
             beats = (w and a["wk"] >= w["wk"] + WEEKLY_MARGIN) or (r and a["ros"] >= r["ros"] + SEASON_MARGIN)
             if beats or a["own"] >= NOTABLE_OWN_PCT:
                 how = "cleared waivers" if prev_tag.get(pid) == "W" else "was dropped"
-                events.append(ev("fa", f"{last_name(a)} free agent",
-                                 f"{a['pos']} {short(a)} {how}, free agent now. "
-                                 f"Wk {a['wk']:.1f}, ROS {a['ros']:.0f}, {a['own']:.0f}% rostered", 4))
+                events.append(ev(d, "fa", f"{last_name(a)} free agent",
+                                 f"{label(a)} {how}, free agent now · wk {a['wk']:.1f}, "
+                                 f"ROS {a['ros']:.0f}, {a['own']:.0f}% rostered", 4, False))
+
+        if settling:
+            base_wk[pid], base_ros[pid] = a["wk"], a["ros"]
+            continue
+
+        bw = base_wk.setdefault(pid, a["wk"])
+        if a["wk"] - bw >= AVAIL_WK_UP and a["wk"] >= AVAIL_WK_FLOOR:
+            w = worst(d["mine"], a["pos"], "wk")
+            if not w or a["wk"] >= RISE_MIN_PCT * w["wk"]:
+                ctx = f" · your worst: {last_name(w)} {w['wk']:.1f}" if w else ""
+                events.append(ev(d, "rise", f"{last_name(a)} rising",
+                                 f"{label(a)}: this week {bw:.1f} → {a['wk']:.1f}{ctx}", 3, False))
+            base_wk[pid] = a["wk"]
+
+        br = base_ros.setdefault(pid, a["ros"])
+        if a["ros"] - br >= AVAIL_ROS_UP:
+            r = worst(d["mine"], a["pos"], "ros")
+            if not r or a["ros"] >= RISE_MIN_PCT * r["ros"]:
+                ctx = f" · your worst: {last_name(r)} {r['ros']:.0f}" if r else ""
+                events.append(ev(d, "rise", f"{last_name(a)} ROS rising",
+                                 f"{label(a)}: rest of season {br:.0f} → {a['ros']:.0f}{ctx}", 3, False))
+            base_ros[pid] = a["ros"]
 
     ls["week"] = d["week"]
     ls["status"] = {m["id"]: m["status"] for m in d["mine"]}
     ls["avail_tag"] = {a["id"]: a["tag"] for a in d["avail"]}
     ls["rostered"] = sorted(d["rostered"])
-    # keep baselines only for players still in view
     seen = {p["id"] for p in d["mine"] + d["avail"]}
     ls["base_wk"] = {k: v for k, v in base_wk.items() if k in seen}
     ls["base_ros"] = {k: v for k, v in base_ros.items() if k in seen}
     return events
 
 
-def send_events(d, events):
+def send_events(events):
+    """One notification for all leagues, grouped by league."""
     if not events:
         return
+    leagues = list(dict.fromkeys(e["league"] for e in events))
     top = max(events, key=lambda e: e["prio"])
-    emoji, tag = EMOJI[top["kind"]]
-    title = f"{d['name']}: {events[0]['title']}" if len(events) == 1 else f"{d['name']}: {len(events)} updates"
-    body = "\n".join(f"{EMOJI[e['kind']][0]} {e['text']}" for e in sorted(events, key=lambda e: -e["prio"]))
-    notify(title, body, priority=top["prio"], tags=[tag], actions=buttons(d), click=d["team_url"])
+    if len(events) == 1:
+        title = f"{events[0]['league']}: {events[0]['title']}"
+    elif len(leagues) == 1:
+        title = f"{leagues[0]}: {len(events)} updates"
+    else:
+        title = f"{len(events)} updates · {len(leagues)} leagues"
+
+    blocks, actions = [], []
+    for lg in leagues:
+        evs = sorted((e for e in events if e["league"] == lg), key=lambda e: -e["prio"])
+        lines = [f"{EMOJI[e['kind']][0]} {e['text']}" for e in evs]
+        blocks.append("\n".join(([lg.upper()] if len(leagues) > 1 else []) + lines))
+        if len(leagues) == 1:
+            actions = [{"action": "view", "label": "Free agents", "url": evs[0]["fa_url"]},
+                       {"action": "view", "label": "My team", "url": evs[0]["team_url"]}]
+        else:
+            url = evs[0]["team_url"] if all(e["roster"] for e in evs) else evs[0]["fa_url"]
+            actions.append({"action": "view", "label": lg, "url": url})
+    notify(title, "\n\n".join(blocks), priority=top["prio"], tags=[EMOJI[top["kind"]][1]],
+           actions=actions[:3], click=events[0]["team_url"])
 
 
 # ================= main =================
@@ -521,6 +690,7 @@ def main():
         print(f"Sleeper unavailable ({ex}); continuing without trending.")
         trending = {}
 
+    events = []
     for lg in LEAGUES:
         lid = str(lg["id"])
         try:
@@ -538,42 +708,45 @@ def main():
             print(f"League {lid} failed: {ex}")
             continue
 
-        kick, byes = schedule(state, d["week"], cookies)
+        kick, byes, byeweek = schedule(state, d["week"], cookies)
 
         def is_locked(p, kick=kick):
             k = kick.get(p["team"])
             return k is not None and k <= now_ts
 
         ls = state["leagues"].setdefault(lid, {})
+        ls.pop("queue", None)  # old per-league queue; replaced by state["queue"]
+        new_events = detect_events(d, ls, is_locked, byes, now_ts)
+        events += new_events
+        settling = now_ts - ls.get("week_start", 0) < SETTLE_HOURS * 3600
         print(f"{d['name']}: week {d['week']}, {len(d['mine'])} rostered, {len(d['avail'])} available, "
-              f"waivers {d['waiver_days']}, {len(kick)} kickoffs known, quiet={quiet}, force={FORCE_DIGEST}")
+              f"{len(kick)} kickoffs known, settling={settling}, events={len(new_events)}")
 
-        # immediate pushes
-        events = detect_events(d, ls, is_locked, byes)
-        queue = ls.get("queue", []) + events
-        print(f"  events this run: {len(events)}, sending now: {0 if quiet else len(queue)}")
-        if quiet:
-            ls["queue"] = queue
-        else:
-            send_events(d, queue)
-            ls["queue"] = []
-
-        # digest
         due = ("forced", True, "Full check") if FORCE_DIGEST else digest_due(now, d["waiver_days"])
         slot = f"{now:%Y-%m-%d}-{now.hour}"
         if due and (FORCE_DIGEST or slot not in ls.get("digests_sent", [])):
-            _, full, label = due
+            _, full, label_text = due
             lineup = lineup_issues(d, is_locked, byes)
-            built = build_digest(d, lineup, pickup_rows(d, is_locked), ls.get("last_digest", {}), full, label)
+            byes_next = bye_holes(d, byeweek) if now.weekday() in LOOKAHEAD_DAYS else []
+            matchup = matchup_line(d, is_locked, lineup) if (full or now.weekday() == 6) else None
+            built = build_digest(d, lineup, pickup_rows(d, is_locked, full), ls.get("last_digest", {}),
+                                 full, label_text, byes_next, matchup)
             print(f"  digest due ({due[0]}): {'sent' if built else 'skipped, nothing new'}")
             if built:
-                title, body, current = built
-                prio = 4 if lineup else 3
-                notify(title, body, priority=prio, tags=["warning" if lineup else "football"],
-                       actions=buttons(d), click=d["fa_url"])
+                title, body, current, new_lineup = built
+                notify(title, body, priority=4 if new_lineup else 3,
+                       tags=["warning" if new_lineup else "football"], actions=buttons(d), click=d["fa_url"])
                 ls["last_digest"] = current
             if not FORCE_DIGEST:
                 ls["digests_sent"] = (ls.get("digests_sent", []) + [slot])[-30:]
+
+    queue = state.get("queue", []) + events
+    print(f"Immediate: {len(events)} new, {len(queue)} queued, quiet={quiet}")
+    if quiet:
+        state["queue"] = queue
+    else:
+        send_events(queue)
+        state["queue"] = []
 
     save_json(STATE_FILE, state)
 
