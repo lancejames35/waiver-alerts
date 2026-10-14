@@ -56,6 +56,7 @@ PREWAIVER_MAX_DAYS = 2               # leagues processing more often than this (
 DEFAULT_WAIVER_DAYS = ["WEDNESDAY"]  # used if the league setting can't be read
 QUIET_START, QUIET_END = 23, 7       # immediate pushes held in this window, sent at 7am
 DIGEST_PER_POSITION = 2
+MAX_QUEUE = 20                       # cap on held-over immediate alerts
 LOOKAHEAD_DAYS = {3, 4, 5, 6}         # Thu-Sun digests include next week's bye holes
 DIGEST_CHANGE_WK = 1.0               # a repeated weekly row only reappears if it moved this many points
 DIGEST_CHANGE_ROS = 10.0             # same for rest-of-season rows (those drift constantly)
@@ -73,7 +74,8 @@ ROSTER_WK_PCT, ROSTER_WK_PTS = 0.30, 3.0
 ROSTER_ROS_PCT, ROSTER_ROS_PTS = 0.15, 20.0
 AVAIL_WK_UP, AVAIL_WK_FLOOR = 4.0, 8.0
 AVAIL_ROS_UP = 20.0
-NOTABLE_OWN_PCT = 50.0               # newly free agent counts as notable at this % rostered on ESPN
+FA_CLEAR_MAX = 5                     # most "now a free agent" alerts per league per run (rest go to the digest)
+MAX_BODY_BYTES = 3800                # ntfy rejects messages over 4096 bytes
 RISE_MIN_PCT = 0.80                  # rising alert only if the player reaches this share of your worst at position
 SETTLE_HOURS = 24                    # no projection-move alerts this long after a new week starts (ESPN rebuilding)
 # ==========================================
@@ -157,18 +159,38 @@ def worst(mine, pos, key, skip_zero=True):
     return min(c, key=lambda m: m[key]) if c else None
 
 
+def fit(message):
+    """Trim to ntfy's size limit on a line boundary."""
+    if len(message.encode()) <= MAX_BODY_BYTES:
+        return message
+    lines, out = message.split("\n"), []
+    for i, line in enumerate(lines):
+        if len("\n".join(out + [line]).encode()) > MAX_BODY_BYTES - 60:
+            out.append(f"… {len(lines) - i} more lines (see the GitHub run log)")
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
 def notify(title, message, priority=3, tags=None, actions=None, click=None):
+    """Sends one push. Returns True on success; never raises, so one bad send can't fail the run."""
+    message = fit(message)
     # always logged, so past notifications can be reviewed from the GitHub run logs
     print(f"\n----- SENT{' (dry run)' if DRY_RUN else ''}: {title}  [priority {priority}] -----\n{message}")
     for a in actions or []:
         print(f"  [{a['label']}] {a['url']}")
     if DRY_RUN:
-        return
-    r = requests.post("https://ntfy.sh/", json={
-        "topic": os.environ["NTFY_TOPIC"], "title": title, "message": message,
-        "priority": priority, "tags": tags or [], "actions": actions or [], "click": click,
-    }, timeout=30)
-    r.raise_for_status()
+        return True
+    try:
+        r = requests.post("https://ntfy.sh/", json={
+            "topic": os.environ["NTFY_TOPIC"], "title": title, "message": message,
+            "priority": priority, "tags": tags or [], "actions": actions or [], "click": click,
+        }, timeout=30)
+        r.raise_for_status()
+        return True
+    except Exception as ex:
+        print(f"!! ntfy send failed: {ex}")
+        return False
 
 
 def buttons(d):
@@ -535,7 +557,7 @@ def digest_due(now, waiver_days):
 # ================= immediate events =================
 
 def ev(d, kind, title, text, prio, roster):
-    return {"league": d["name"], "fa_url": d["fa_url"], "team_url": d["team_url"],
+    return {"v": 3, "league": d["name"], "fa_url": d["fa_url"], "team_url": d["team_url"],
             "kind": kind, "title": title, "text": text, "prio": prio, "roster": roster}
 
 
@@ -550,7 +572,7 @@ def detect_events(d, ls, is_locked, byes, now_ts):
     prev_status = ls.get("status", {})
     prev_tag = ls.get("avail_tag", {})
     prev_rostered = set(ls.get("rostered", []))
-    events = []
+    events, cleared = [], []
 
     def moved(cur, base, pct, pts):
         return abs(cur - base) >= pts and (base == 0 or abs(cur - base) >= pct * base)
@@ -598,14 +620,15 @@ def detect_events(d, ls, is_locked, byes, now_ts):
             continue
 
         was_held = prev_tag.get(pid) != "FA" and (pid in prev_rostered or prev_tag.get(pid) == "W")
-        if not first_run and a["tag"] == "FA" and was_held:
-            w, r = worst(d["mine"], a["pos"], "wk"), worst(d["mine"], a["pos"], "ros")
-            beats = (w and a["wk"] >= w["wk"] + WEEKLY_MARGIN) or (r and a["ros"] >= r["ros"] + SEASON_MARGIN)
-            if beats or a["own"] >= NOTABLE_OWN_PCT:
-                how = "cleared waivers" if prev_tag.get(pid) == "W" else "was dropped"
-                events.append(ev(d, "fa", f"{last_name(a)} free agent",
-                                 f"{label(a)} {how}, free agent now · wk {a['wk']:.1f}, "
-                                 f"ROS {a['ros']:.0f}, {a['own']:.0f}% rostered", 4, False))
+        if not first_run and a["tag"] == "FA" and was_held and a["ros"] > 0:
+            # rolling waivers clear dozens of players at once, so only real upgrades count:
+            # beats your worst at the position for the season, or clearly this week
+            r = worst(d["mine"], a["pos"], "ros")
+            w = worst(d["mine"], a["pos"], "wk")
+            ros_edge = a["ros"] - r["ros"] if r else 0
+            wk_edge = a["wk"] - w["wk"] if w else 0
+            if ros_edge >= SEASON_MARGIN or wk_edge >= 2 * WEEKLY_MARGIN:
+                cleared.append((ros_edge + 10 * wk_edge, a, r or w))
 
         if settling:
             base_wk[pid], base_ros[pid] = a["wk"], a["ros"]
@@ -629,6 +652,17 @@ def detect_events(d, ls, is_locked, byes, now_ts):
                                  f"{label(a)}: rest of season {br:.0f} → {a['ros']:.0f}{ctx}", 3, False))
             base_ros[pid] = a["ros"]
 
+    cleared.sort(key=lambda c: -c[0])
+    for _, a, base in cleared[:FA_CLEAR_MAX]:
+        how = "cleared waivers" if prev_tag.get(a["id"]) == "W" else "was dropped"
+        events.append(ev(d, "fa", f"{last_name(a)} free agent",
+                         f"{label(a)} {how} · wk {a['wk']:.1f}, ROS {a['ros']:.0f}"
+                         + (f", drop {last_name(drop_candidate(d, a['pos']))}" if drop_candidate(d, a["pos"]) else ""),
+                         4, False))
+    if len(cleared) > FA_CLEAR_MAX:
+        events.append(ev(d, "fa", "more free agents", f"+{len(cleared) - FA_CLEAR_MAX} more upgrades cleared "
+                         "waivers, see the next digest", 3, False))
+
     ls["week"] = d["week"]
     ls["status"] = {m["id"]: m["status"] for m in d["mine"]}
     ls["avail_tag"] = {a["id"]: a["tag"] for a in d["avail"]}
@@ -640,9 +674,9 @@ def detect_events(d, ls, is_locked, byes, now_ts):
 
 
 def send_events(events):
-    """One notification for all leagues, grouped by league."""
+    """One notification for all leagues, grouped by league. Returns True if sent (or nothing to send)."""
     if not events:
-        return
+        return True
     leagues = list(dict.fromkeys(e["league"] for e in events))
     top = max(events, key=lambda e: e["prio"])
     if len(events) == 1:
@@ -663,8 +697,8 @@ def send_events(events):
         else:
             url = evs[0]["team_url"] if all(e["roster"] for e in evs) else evs[0]["fa_url"]
             actions.append({"action": "view", "label": lg, "url": url})
-    notify(title, "\n\n".join(blocks), priority=top["prio"], tags=[EMOJI[top["kind"]][1]],
-           actions=actions[:3], click=events[0]["team_url"])
+    return notify(title, "\n\n".join(blocks), priority=top["prio"], tags=[EMOJI[top["kind"]][1]],
+                  actions=actions[:3], click=events[0]["team_url"])
 
 
 # ================= main =================
@@ -716,39 +750,48 @@ def main():
 
         ls = state["leagues"].setdefault(lid, {})
         ls.pop("queue", None)  # old per-league queue; replaced by state["queue"]
-        new_events = detect_events(d, ls, is_locked, byes, now_ts)
-        events += new_events
-        settling = now_ts - ls.get("week_start", 0) < SETTLE_HOURS * 3600
-        print(f"{d['name']}: week {d['week']}, {len(d['mine'])} rostered, {len(d['avail'])} available, "
-              f"{len(kick)} kickoffs known, settling={settling}, events={len(new_events)}")
+        try:
+            run_league(d, ls, now, now_ts, is_locked, byes, byeweek, events)
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            print(f"!! {d['name']} failed this run: {ex}")
 
-        due = ("forced", True, "Full check") if FORCE_DIGEST else digest_due(now, d["waiver_days"])
-        slot = f"{now:%Y-%m-%d}-{now.hour}"
-        if due and (FORCE_DIGEST or slot not in ls.get("digests_sent", [])):
-            _, full, label_text = due
-            lineup = lineup_issues(d, is_locked, byes)
-            byes_next = bye_holes(d, byeweek) if now.weekday() in LOOKAHEAD_DAYS else []
-            matchup = matchup_line(d, is_locked, lineup) if (full or now.weekday() == 6) else None
-            built = build_digest(d, lineup, pickup_rows(d, is_locked, full), ls.get("last_digest", {}),
-                                 full, label_text, byes_next, matchup)
-            print(f"  digest due ({due[0]}): {'sent' if built else 'skipped, nothing new'}")
-            if built:
-                title, body, current, new_lineup = built
-                notify(title, body, priority=4 if new_lineup else 3,
-                       tags=["warning" if new_lineup else "football"], actions=buttons(d), click=d["fa_url"])
-                ls["last_digest"] = current
-            if not FORCE_DIGEST:
-                ls["digests_sent"] = (ls.get("digests_sent", []) + [slot])[-30:]
-
-    queue = state.get("queue", []) + events
+    queue = [e for e in state.get("queue", []) if e.get("v") == 3] + events
+    queue = sorted(queue, key=lambda e: -e["prio"])[:MAX_QUEUE]
     print(f"Immediate: {len(events)} new, {len(queue)} queued, quiet={quiet}")
     if quiet:
         state["queue"] = queue
     else:
-        send_events(queue)
-        state["queue"] = []
+        state["queue"] = [] if send_events(queue) else queue  # failed sends retry next run
 
     save_json(STATE_FILE, state)
+
+
+def run_league(d, ls, now, now_ts, is_locked, byes, byeweek, events):
+    new_events = detect_events(d, ls, is_locked, byes, now_ts)
+    events += new_events
+    settling = now_ts - ls.get("week_start", 0) < SETTLE_HOURS * 3600
+    print(f"{d['name']}: week {d['week']}, {len(d['mine'])} rostered, {len(d['avail'])} available, "
+          f"settling={settling}, events={len(new_events)}")
+
+    due = ("forced", True, "Full check") if FORCE_DIGEST else digest_due(now, d["waiver_days"])
+    slot = f"{now:%Y-%m-%d}-{now.hour}"
+    if due and (FORCE_DIGEST or slot not in ls.get("digests_sent", [])):
+        _, full, label_text = due
+        lineup = lineup_issues(d, is_locked, byes)
+        byes_next = bye_holes(d, byeweek) if now.weekday() in LOOKAHEAD_DAYS else []
+        matchup = matchup_line(d, is_locked, lineup) if (full or now.weekday() == 6) else None
+        built = build_digest(d, lineup, pickup_rows(d, is_locked, full), ls.get("last_digest", {}),
+                             full, label_text, byes_next, matchup)
+        print(f"  digest due ({due[0]}): {'sending' if built else 'skipped, nothing new'}")
+        if built:
+            title, body, current, new_lineup = built
+            if notify(title, body, priority=4 if new_lineup else 3,
+                      tags=["warning" if new_lineup else "football"], actions=buttons(d), click=d["fa_url"]):
+                ls["last_digest"] = current
+        if not FORCE_DIGEST:
+            ls["digests_sent"] = (ls.get("digests_sent", []) + [slot])[-30:]
 
 
 if __name__ == "__main__":
